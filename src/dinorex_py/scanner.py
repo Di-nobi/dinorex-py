@@ -43,6 +43,7 @@ ROUTE_PATTERNS: list[str] = [
     "**/*resource*.py",
     "**/*resources*.py",
     "**/api/**/*.py",
+    "**/apis/**/*.py",
     "**/app/**/*.py",
 ]
 

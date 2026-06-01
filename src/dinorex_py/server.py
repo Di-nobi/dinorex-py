@@ -1,22 +1,21 @@
 """
 server.py — Lightweight Flask server that serves the Dinorex UI and API.
-Mirrors the same endpoints as the Node version so the same frontend works.
+No longer calls AI directly — spec comes from the Dinorex backend via the CLI.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+from .store import diff_scan, load_store, save_store, ApiSpec, hash_content
 from .scanner import scan_project
-from .store import diff_scan, load_store, save_store, ApiSpec
+from .auth import load_auth, api_request
 
-# Public folder lives at src/public relative to this file
 _HERE = Path(__file__).parent
 PUBLIC_DIR = _HERE / "public"
 
@@ -24,12 +23,10 @@ PUBLIC_DIR = _HERE / "public"
 def create_app(
     target_dir: str,
     cached_spec: Optional[ApiSpec] = None,
-    provider: str = "anthropic",
 ) -> Flask:
     app = Flask(__name__, static_folder=None)
     CORS(app)
 
-    # ── State ────────────────────────────────────────────────────────────────
     state: dict[str, Any] = {
         "spec": cached_spec,
         "analyzing": False,
@@ -40,56 +37,67 @@ def create_app(
         ),
     }
 
-    def _get_agent():
-        if provider == "groq":
-            from .agent_groq import analyze_with_ai, analyze_incremental
-        else:
-            from .agent import analyze_with_ai, analyze_incremental
-        return analyze_with_ai, analyze_incremental
-
     def run_analysis(force_rescan: bool = False) -> None:
         if state["analyzing"]:
             return
         state["analyzing"] = True
+
         try:
+            auth = load_auth()
+            if not auth:
+                state["status"] = {"state": "error", "message": "Not authenticated. Run: dinorex login"}
+                return
+
             result = scan_project(target_dir)
             all_files = (
-                result.collected.routes
-                + result.collected.controllers
-                + result.collected.services
-                + result.collected.models
+                result.collected.routes + result.collected.controllers +
+                result.collected.services + result.collected.models
             )
-            analyze_with_ai, analyze_incremental = _get_agent()
             stored = load_store(target_dir)
 
             if not force_rescan and stored and stored.get("spec") and stored.get("hashes"):
-                state["status"] = {
-                    "state": "analyzing",
-                    "message": "Checking for new/changed endpoints...",
-                }
+                state["status"] = {"state": "analyzing", "message": "Checking for new/changed endpoints..."}
                 diff = diff_scan(stored["hashes"], all_files)
-                spec, changed = analyze_incremental(stored["spec"], diff)
-                state["spec"] = spec
-                if changed:
-                    save_store(target_dir, spec, diff.new_hashes)
-                    state["status"] = {
-                        "state": "ready",
-                        "message": "Spec updated with new endpoints.",
-                    }
-                else:
-                    state["status"] = {"state": "ready", "message": "No changes detected."}
-            else:
-                state["status"] = {
-                    "state": "analyzing",
-                    "message": "Running full AI analysis...",
-                }
-                project_name = Path(target_dir).name
-                spec = analyze_with_ai(result.collected, project_name)
-                state["spec"] = spec
 
-                from .store import hash_content
+                if not diff.new_files and not diff.changed_files and not diff.removed_files:
+                    state["spec"] = stored["spec"]
+                    state["status"] = {"state": "ready", "message": "No changes detected."}
+                    return
+
+                # Send only changed files to server
+                changed = diff.new_files + diff.changed_files
+                route_paths  = {f.path for f in result.collected.routes}
+                ctrl_paths   = {f.path for f in result.collected.controllers}
+                svc_paths    = {f.path for f in result.collected.services}
+                model_paths  = {f.path for f in result.collected.models}
+
+                res = api_request("/scan", method="POST", token=auth["token"], body={
+                    "projectName": Path(target_dir).name,
+                    "routes":      [f.__dict__ for f in changed if f.path in route_paths],
+                    "controllers": [f.__dict__ for f in changed if f.path in ctrl_paths],
+                    "services":    [f.__dict__ for f in changed if f.path in svc_paths],
+                    "models":      [f.__dict__ for f in changed if f.path in model_paths],
+                    "existingSpec": stored["spec"],
+                    "removedFiles": diff.removed_files,
+                })
+                state["spec"] = res["spec"]
                 hashes = {f.path: hash_content(f.content) for f in all_files}
-                save_store(target_dir, spec, hashes)
+                save_store(target_dir, res["spec"], hashes)
+                state["status"] = {"state": "ready", "message": "Spec updated with new endpoints."}
+
+            else:
+                state["status"] = {"state": "analyzing", "message": "Sending files to Dinorex server..."}
+
+                res = api_request("/scan", method="POST", token=auth["token"], body={
+                    "projectName": Path(target_dir).name,
+                    "routes":      [f.__dict__ for f in result.collected.routes],
+                    "controllers": [f.__dict__ for f in result.collected.controllers],
+                    "services":    [f.__dict__ for f in result.collected.services],
+                    "models":      [f.__dict__ for f in result.collected.models],
+                })
+                state["spec"] = res["spec"]
+                hashes = {f.path: hash_content(f.content) for f in all_files}
+                save_store(target_dir, res["spec"], hashes)
                 state["status"] = {"state": "ready", "message": "Full analysis complete."}
 
         except Exception as exc:
@@ -97,7 +105,7 @@ def create_app(
         finally:
             state["analyzing"] = False
 
-    # ── Bootstrap ─────────────────────────────────────────────────────────────
+    # Bootstrap
     if not cached_spec:
         stored = load_store(target_dir)
         if stored and stored.get("spec"):
@@ -133,7 +141,7 @@ def create_app(
         threading.Thread(target=run_analysis, args=(True,), daemon=True).start()
         return jsonify({"message": "Full rescan started"})
 
-    # ── Static (serve the same frontend) ──────────────────────────────────────
+    # ── Static ─────────────────────────────────────────────────────────────────
 
     @app.get("/")
     def index():
@@ -141,7 +149,6 @@ def create_app(
 
     @app.get("/<path:filename>")
     def static_files(filename: str):
-        # Try public dir first, fall back to index.html for SPA routing
         target = PUBLIC_DIR / filename
         if target.exists() and target.is_file():
             return send_from_directory(str(PUBLIC_DIR), filename)
@@ -154,14 +161,12 @@ def start_server(
     target_dir: str,
     port: int = 4321,
     cached_spec: Optional[ApiSpec] = None,
-    provider: str = "anthropic",
 ) -> dict[str, Any]:
-    app = create_app(target_dir, cached_spec=cached_spec, provider=provider)
+    app = create_app(target_dir, cached_spec=cached_spec)
     url = f"http://localhost:{port}"
-
-    server_thread = threading.Thread(
+    thread = threading.Thread(
         target=lambda: app.run(port=port, debug=False, use_reloader=False),
         daemon=True,
     )
-    server_thread.start()
-    return {"app": app, "port": port, "url": url, "thread": server_thread}
+    thread.start()
+    return {"app": app, "port": port, "url": url, "thread": thread}
